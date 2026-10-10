@@ -1,0 +1,43 @@
+# nurse24hr configuration. All thresholds live here, not in Python.
+# Distances are in face-widths; times in seconds; velocities in face-widths per second.
+
+thresholds:
+  # Proximity bands (hysteresis: watch < grasp < release)
+  d_watch: 0.6        # IDLE -> WATCH when hand closer than this
+  d_grasp: 0.3        # hand is "at the tube" below this
+  d_release: 0.8      # hand is "away" above this
+
+  # Dwell timers
+  t_grasp: 1.5        # continuous time at the tube before WARN
+  t_alarm: 3.0        # time in WARN before ALARM (no pull needed)
+  t_release: 2.0      # time away before returning to IDLE
+
+  # Pull / grasp evidence
+  v_pull: 0.8         # radial wrist speed away from tube that counts as a pull
+  disp_max: 0.3       # tube displacement from baseline that alarms on its own
+  osc_max: 0.05       # wrist oscillation above this = scratching/rubbing, not grasping
+  pinch_max: 0.12     # thumb-index distance below this = pinch grip
+
+  # Confidence / fault
+  conf_min: 0.5       # frames below this hold state and count toward fault
+  t_fault: 5.0        # sustained low confidence -> FAULT
+
+  # Robustness
+  max_dt: 0.5         # cap per-frame dt so a stall never jumps a timer
+  missing_evidence_counts: true   # if osc and pinch are both unavailable, treat grasp evidence as present (favours recall)
+
+capture:
+  source: webcam      # webcam | <file.mp4> | rtsp://...
+  fps: 15
+  roi: null           # [x0, y0, x1, y1] in pixels, null = full frame
+
+alarm:
+  warn_sound: null    # v1: WARN is station-only, no bedside sound
+  alarm_sound: sounds/alarm.wav
+  fault_sound: sounds/fault.wav
+  escalate_after_s: 30
+
+mqtt:
+  broker: localhost
+  port: 1883
+  bed: bed-01

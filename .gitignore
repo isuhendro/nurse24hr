@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+data/
+clips/
+*.parquet
+*.mp4
+.DS_Store
