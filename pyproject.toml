@@ -1,12 +1,16 @@
 [project]
 name = "nurse24hr"
 version = "0.1.0"
-description = "Camera-based feeding-tube pull-out monitor. Step 1: state machine, simulator, tests."
+description = "Camera-based feeding-tube pull-out monitor."
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
+    "opencv-python>=4.10",
     "pyyaml>=6.0",
 ]
+
+[project.scripts]
+nurse24hr = "nurse24hr.app:main"
 
 [dependency-groups]
 dev = [

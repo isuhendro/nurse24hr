@@ -334,7 +334,7 @@ Real patients differ from volunteers: tremor, restless sleep, confusion, restrai
 ## 9. Build order (Phase 1)
 
 1. ~~`events.py` + `simulate.py` + pytest suite (§7.2). No camera needed. Scratch-vs-pull logic proven here first.~~ **Done 2026-10-11.**
-2. Capture + debug overlay, webcam and file sources.
+2. ~~Capture + debug overlay, webcam and file sources.~~ **Done 2026-10-11.** `capture.py`, `overlay.py`, `app.py`, `Perceiver` interface with a zero-confidence placeholder so the pipeline fails loud (FAULT) until step 3 lands.
 3. Perception → `Features` (incl. `pinch`, `osc`, `v_radial`), Parquet logging.
 4. Staged recording sessions (§7.3); replay their features through `events.py`; first real threshold tuning.
 5. Alarm manager + watchdog.
