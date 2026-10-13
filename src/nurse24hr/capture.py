@@ -10,8 +10,9 @@ Timestamps
 * Live sources (webcam, RTSP): ``time.monotonic()`` at read.
 * Files: ``frame_index / file_fps`` so a replay is deterministic and the state
   machine timers are the same on every run. By default playback is paced to
-  real time so the overlay is watchable; ``realtime=False`` runs as fast as the
-  decoder allows.
+  real time so the overlay is watchable and stale frames are dropped like a
+  live camera. ``realtime=False`` is offline analysis: it runs as fast as the
+  consumer allows and applies back-pressure so **every** frame is processed.
 
 The thread exposes ``last_read_t`` (wall clock) and ``frames_read`` so a
 watchdog can detect a dead or frozen source.
@@ -48,11 +49,27 @@ class LatestFrame:
         """Frames overwritten before any consumer took them."""
 
     def put(self, frame: Frame) -> None:
+        """Overwrite the slot. A frame nobody took yet is counted as dropped."""
         with self._cond:
             if self._frame is not None and self._frame.seq > self._seen_seq:
                 self.dropped += 1
             self._frame = frame
             self._cond.notify_all()
+
+    def put_wait(self, frame: Frame, stop: threading.Event, poll_s: float = 0.05) -> bool:
+        """Back-pressure variant: wait until the previous frame was taken, then put.
+
+        Used for unpaced file replay so every frame is processed. Returns False
+        if ``stop`` was set while waiting.
+        """
+        with self._cond:
+            while self._frame is not None and self._frame.seq > self._seen_seq:
+                if stop.is_set():
+                    return False
+                self._cond.wait(poll_s)
+            self._frame = frame
+            self._cond.notify_all()
+            return True
 
     def get(self, timeout: float | None = None) -> Frame | None:
         """Return the newest frame not yet returned by ``get``, or None on timeout."""
@@ -61,11 +78,42 @@ class LatestFrame:
                 return None
             assert self._frame is not None
             self._seen_seq = self._frame.seq
+            self._cond.notify_all()  # wake a producer blocked in put_wait
             return self._frame
 
     def peek(self) -> Frame | None:
         with self._cond:
             return self._frame
+
+
+def is_live_source(source: int | str) -> bool:
+    return isinstance(source, int) or str(source).lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
+
+
+def authorize_camera(source: str | int) -> str | None:
+    """macOS: trigger the camera permission prompt from the *calling* (main) thread.
+
+    OpenCV's AVFoundation backend can only request authorisation on the main
+    run loop; opened from a worker thread it fails with "can not spin main run
+    loop from other thread". So the run loop opens the device once here, which
+    shows the system prompt on first use, then sets
+    ``OPENCV_AVFOUNDATION_SKIP_AUTH`` so the capture thread does not try again.
+    Returns an error string if the device could not be opened, else None.
+    """
+    import os
+    import sys
+
+    src = parse_source(source)
+    if sys.platform != "darwin" or not isinstance(src, int):
+        return None
+    cap = cv2.VideoCapture(src)
+    ok = cap.isOpened()
+    cap.release()
+    os.environ.setdefault("OPENCV_AVFOUNDATION_SKIP_AUTH", "1")
+    if not ok:
+        return ("cannot open camera. On macOS grant camera access to your terminal app in "
+                "System Settings > Privacy & Security > Camera, then run again.")
+    return None
 
 
 def parse_source(source: str | int) -> int | str:
@@ -163,7 +211,14 @@ class CaptureThread(threading.Thread):
                     last_emit = now
                 self.frames_read += 1
                 self.last_read_t = time.monotonic()
-                self.slot.put(Frame(seq=seq, t=t, image=img))
+                frame = Frame(seq=seq, t=t, image=img)
+                if self.is_file and not self.realtime:
+                    # Offline analysis: every frame matters, so block until the consumer
+                    # has taken the previous one instead of dropping it.
+                    if not self.slot.put_wait(frame, self._stop_evt):
+                        return
+                else:
+                    self.slot.put(frame)
                 seq += 1
         finally:
             cap.release()

@@ -46,7 +46,7 @@ def draw_hud(img: np.ndarray, info: HudInfo, f: Features | None, m: EventMachine
 
     # State banner
     cv2.rectangle(img, (0, 0), (w, 34), colour, -1)
-    label = m.state.value + ("  (latched, press a to ack)" if m.state.latched else "")
+    label = m.state.value + ("  (latched: press a in this window, type a+Enter in terminal, or ACK on the page)" if m.state.latched else "")
     cv2.putText(img, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     if info.paused:
         cv2.putText(img, "PAUSED", (w - 110, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
@@ -57,11 +57,11 @@ def draw_hud(img: np.ndarray, info: HudInfo, f: Features | None, m: EventMachine
     ]
     if f is not None:
         lines += [
-            f"d {_fmt(f.d)}  conf {f.conf:.2f}  persons {f.n_persons}",
+            f"d {_fmt(f.d)}  d_tape {_fmt(f.d_tape)}  conf {f.conf:.2f}  persons {f.n_persons}",
             f"v_rad {_fmt(f.v_radial)}  pinch {_fmt(f.pinch)}  osc {_fmt(f.osc, '.3f')}  disp {_fmt(f.tube_disp)}",
         ]
     lines.append(
-        f"grasp {m.grasp_dwell:4.1f}s  warn {m.warn_dwell:4.1f}s  release {m.release_dwell:4.1f}s  lowconf {m.lowconf_dwell:4.1f}s"
+        f"grasp {m.grasp_dwell:4.1f}s  tape {m.tape_dwell:4.1f}s  warn {m.warn_dwell:4.1f}s  release {m.release_dwell:4.1f}s  lowconf {m.lowconf_dwell:4.1f}s"
     )
     y = 54
     for line in lines:

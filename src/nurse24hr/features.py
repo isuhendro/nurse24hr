@@ -43,8 +43,13 @@ class Features:
     tube_disp: float | None = None
     """Displacement of tube_pt from its rolling baseline / face_w. Rises during a pull."""
 
+    d_tape: float | None = None
+    """Distance from the closer hand's grip point to the nearest tape anchor on the cheek / face_w.
+    Picking at the tape that secures the tube is a WARN-level precursor to a pull."""
+
     # Raw measurements, kept for logging and offline debugging only.
     wrist_l: Point | None = None
     wrist_r: Point | None = None
     tube_pt: Point | None = None
     face_w: float | None = None
+    tape_pt: Point | None = None

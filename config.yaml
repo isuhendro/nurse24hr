@@ -9,13 +9,13 @@ thresholds:
 
   # Dwell timers
   t_grasp: 1.5        # continuous time at the tube before WARN
-  t_alarm: 3.0        # time in WARN before ALARM (no pull needed)
+  t_alarm: 3.0        # time in WARN (hand on tube) before ALARM, no pull needed
   t_release: 2.0      # time away before returning to IDLE
 
   # Pull / grasp evidence
-  v_pull: 0.8         # radial wrist speed away from tube that counts as a pull
+  v_pull: 0.8         # radial speed away from tube that counts as a pull
   disp_max: 0.3       # tube displacement from baseline that alarms on its own
-  osc_max: 0.05       # wrist oscillation above this = scratching/rubbing, not grasping
+  osc_max: 0.05       # oscillation above this = scratching/rubbing, not grasping
   pinch_max: 0.12     # thumb-index distance below this = pinch grip
 
   # Confidence / fault
@@ -24,20 +24,71 @@ thresholds:
 
   # Robustness
   max_dt: 0.5         # cap per-frame dt so a stall never jumps a timer
-  missing_evidence_counts: true   # if osc and pinch are both unavailable, treat grasp evidence as present (favours recall)
+  missing_evidence_counts: true   # if osc and pinch are both unavailable, dwell alone may raise WARN (favours recall)
+  missing_evidence_alarms: false  # ... but the WARN-dwell ALARM needs real pinch/osc evidence seen at least once. Coarse body-model hands drift onto the face when the real hands are hidden.
+  t_single_person: 1.5            # after a second person was seen, the count must read one for this long before WARN/ALARM may fire (the per-frame count flickers while a caregiver leans over)
+  t_warn_reset: 1.0               # in WARN, hand outside the watch band for this long resets the ALARM dwell clock
+
+  # Tape on the cheek
+  tape_warn: true     # a still/pinched hand dwelling at the tape anchor raises WARN (never ALARM by itself)
+  pull_arm_s: 0.5     # pull motion only counts if the hand was at the tube within this many seconds
+
+  # Agitation
+  reach_count_warn: 3 # this many entries into WATCH within reach_window_s raise WARN "repeated reaching" (0 disables)
+  reach_window_s: 60
 
 capture:
-  source: webcam      # webcam | <file.mp4> | rtsp://...
+  source: webcam      # webcam | <index> | <file.mp4> | rtsp://...
   fps: 15
   roi: null           # [x0, y0, x1, y1] in pixels, null = full frame
 
+perception:
+  backend: mediapipe  # mediapipe | none
+  hand_model: models/hand_landmarker.task
+  face_model: models/face_landmarker.task
+  pose_model: models/pose_landmarker_lite.task   # body model: "is the patient here" + coarse anchors; null disables
+  pose_every_n: 1     # run pose on every n-th frame (most expensive stage)
+  pose_detection_confidence: 0.25   # lower than the face threshold; a small masked patient needs it
+  pose_hand_min_vis: 0.5            # body-model wrist/index visibility needed to count as a coarse hand; low-visibility points sit on the face when the hands are under the blanket
+  tube_side: center   # center (subnasale) | left | right  -- subject's side the NG tube is taped to
+  tape_side: null     # null = same as tube_side; center = both cheeks. Where the securing tape sits.
+  num_hands: 4
+  num_faces: 2
+  tube_weights: null  # path to a trained YOLO tube detector (.pt); null = v1 nostril proxy only
+  auto_zoom: true     # track the face and run detection on a crop around it (digital zoom for far cameras)
+  face_scale_max: 1.6 # a face this many times larger/smaller than the tracked patient's is someone else (visitor leaning in); 0 disables
+  face_relearn_s: 30  # no accepted face for this long drops the size baseline (camera moved)
+  min_detection_confidence: 0.4
+
 alarm:
-  warn_sound: null    # v1: WARN is station-only, no bedside sound
+  warn_sound: sounds/warn.wav   # soft chime at the bedside on WARN; set to null for station-only
   alarm_sound: sounds/alarm.wav
   fault_sound: sounds/fault.wav
   escalate_after_s: 30
+  audit_log: logs/audit.jsonl
+
+watchdog:
+  camera_loss_s: 2.0
+  frozen_s: 5.0
+  stall_s: 2.0
+  heartbeat_s: 10.0
+
+recorder:
+  enabled: true
+  out_dir: clips
+  pre_s: 10
+  post_s: 10
+
+logging:
+  features: auto      # auto = logs/features-<timestamp>.parquet per run; a path; or null to disable (or pass --log)
+
+web:
+  enabled: false      # nurse-side page with live state and ACK button (or pass --web)
+  host: 127.0.0.1
+  port: 8765
 
 mqtt:
+  enabled: false      # publish to a broker (or pass --mqtt); needs paho-mqtt
   broker: localhost
   port: 1883
   bed: bed-01

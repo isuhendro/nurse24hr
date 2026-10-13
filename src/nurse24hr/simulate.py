@@ -47,12 +47,16 @@ class Scenario:
 
 
 class Trajectory:
-    """Piecewise builder. Rows are (d, pinch, disp, conf, n_persons)."""
+    """Piecewise builder. Rows are (d, pinch, disp, conf, n_persons, d_tape).
+
+    ``tape`` is the hand's distance to the cheek tape anchor; ``None`` means
+    unknown (the default, so the original scenarios are unaffected).
+    """
 
     def __init__(self, rng: np.random.Generator, fps: int = FPS) -> None:
         self.rng = rng
         self.fps = fps
-        self.rows: list[tuple[float, float, float, float, int]] = []
+        self.rows: list[tuple[float, float, float, float, int, float | None]] = []
         self.labels: list[tuple[float, float, str]] = []
 
     @property
@@ -63,38 +67,43 @@ class Trajectory:
         return max(1, round(dur * self.fps))
 
     def hold(self, dur: float, d: float, *, pinch: float = OPEN_HAND, disp: float = 0.0,
-             conf: float = 0.95, n: int = 1, noise: float = 0.01, label: str | None = None) -> Trajectory:
+             conf: float = 0.95, n: int = 1, noise: float = 0.01, label: str | None = None,
+             tape: float | None = None) -> Trajectory:
         """Hand stays put with small jitter."""
         t0 = self.t
         for _ in range(self._n(dur)):
-            self.rows.append((max(0.0, d + self.rng.normal(0, noise)), pinch, disp, conf, n))
+            tp = None if tape is None else max(0.0, tape + self.rng.normal(0, noise))
+            self.rows.append((max(0.0, d + self.rng.normal(0, noise)), pinch, disp, conf, n, tp))
         if label:
             self.labels.append((t0, self.t, label))
         return self
 
     def oscillate(self, dur: float, center: float, amp: float, freq: float, *, pinch: float = OPEN_HAND,
                   disp: float = 0.0, conf: float = 0.95, n: int = 1, noise: float = 0.01,
-                  label: str | None = None) -> Trajectory:
+                  label: str | None = None, tape: float | None = None, tape_amp: float = 0.0) -> Trajectory:
         """Scratch / rub: sinusoidal hand motion around the contact point."""
         t0 = self.t
         phase = self.rng.uniform(0, 2 * math.pi)
         for i in range(self._n(dur)):
-            d = center + amp * math.sin(2 * math.pi * freq * i / self.fps + phase) + self.rng.normal(0, noise)
-            self.rows.append((max(0.0, d), pinch, disp, conf, n))
+            osc = math.sin(2 * math.pi * freq * i / self.fps + phase)
+            d = center + amp * osc + self.rng.normal(0, noise)
+            tp = None if tape is None else max(0.0, tape + tape_amp * osc + self.rng.normal(0, noise))
+            self.rows.append((max(0.0, d), pinch, disp, conf, n, tp))
         if label:
             self.labels.append((t0, self.t, label))
         return self
 
     def ramp(self, dur: float, d0: float, d1: float, *, pinch: float = OPEN_HAND, disp0: float = 0.0,
              disp1: float = 0.0, conf: float = 0.95, n: int = 1, noise: float = 0.01,
-             label: str | None = None) -> Trajectory:
+             label: str | None = None, tape0: float | None = None, tape1: float | None = None) -> Trajectory:
         """Linear move of the hand (and optionally the tube)."""
         t0 = self.t
         steps = self._n(dur)
         for i in range(steps):
             a = (i + 1) / steps
             d = d0 + (d1 - d0) * a + self.rng.normal(0, noise)
-            self.rows.append((max(0.0, d), pinch, disp0 + (disp1 - disp0) * a, conf, n))
+            tp = None if tape0 is None or tape1 is None else max(0.0, tape0 + (tape1 - tape0) * a + self.rng.normal(0, noise))
+            self.rows.append((max(0.0, d), pinch, disp0 + (disp1 - disp0) * a, conf, n, tp))
         if label:
             self.labels.append((t0, self.t, label))
         return self
@@ -106,7 +115,7 @@ class Trajectory:
         half = max(1, round(period * self.fps / 2))
         for i in range(self._n(dur)):
             conf = low_conf if (i // half) % 2 else high_conf
-            self.rows.append((max(0.0, d + self.rng.normal(0, noise)), pinch, 0.0, conf, 1))
+            self.rows.append((max(0.0, d + self.rng.normal(0, noise)), pinch, 0.0, conf, 1, None))
         if label:
             self.labels.append((t0, self.t, label))
         return self
@@ -125,9 +134,16 @@ class Trajectory:
         # light smoothing over 2 frames, as perception would do
         v[1:] = 0.5 * (v[1:] + v[:-1])
         win = self.fps
-        osc = np.array([d[max(0, i - win + 1): i + 1].std() for i in range(n)])
+        # osc is the hand's own motion; with only anchor distances available, the
+        # larger scatter of the two distances is the honest proxy.
+        tape = np.array([np.nan if r[5] is None else r[5] for r in self.rows])
+        osc = np.array([
+            max(d[max(0, i - win + 1): i + 1].std(),
+                0.0 if np.isnan(tape[i]) else np.nanstd(tape[max(0, i - win + 1): i + 1]))
+            for i in range(n)
+        ])
         out = []
-        for i, (di, pinch, disp, conf, np_) in enumerate(self.rows):
+        for i, (di, pinch, disp, conf, np_, tp) in enumerate(self.rows):
             out.append(Features(
                 t=float(t[i]),
                 d=float(di),
@@ -137,6 +153,7 @@ class Trajectory:
                 pinch=float(pinch) if with_evidence else None,
                 osc=float(osc[i]) if with_evidence else None,
                 tube_disp=float(disp) if with_tube_disp else None,
+                d_tape=None if tp is None else float(tp),
             ))
         return out
 
@@ -243,7 +260,45 @@ def landmark_dropout_during_grasp(rng: np.random.Generator) -> Scenario:
                     expect_final=State.IDLE, labels=tr.labels)
 
 
+def tape_pick(rng: np.random.Generator) -> Scenario:
+    """Hand picks at the cheek tape: still, pinched, 2-5 s. Tube itself stays ~0.7 away. WARN, never ALARM."""
+    tr = Trajectory(rng)
+    tr.hold(2.0, FAR, tape=FAR, label="idle")
+    tr.ramp(0.5, FAR, 0.7, tape0=FAR, tape1=0.1)
+    tr.hold(rng.uniform(2.0, 5.0), 0.7, pinch=PINCH_GRIP, tape=0.1, label="tape")
+    tr.ramp(0.4, 0.7, FAR, pinch=PINCH_GRIP, tape0=0.1, tape1=FAR)  # leaves still pinched: not a pull
+    tr.hold(3.0, FAR, tape=FAR, label="idle")
+    return Scenario("tape_pick", tr.build(), must_reach=State.WARN, max_state=State.WARN, expect_final=State.IDLE, labels=tr.labels)
+
+
+def cheek_scratch(rng: np.random.Generator) -> Scenario:
+    """Scratch at the cheek tape: oscillating, open fingers. WATCH only."""
+    tr = Trajectory(rng)
+    tr.hold(2.0, FAR, tape=FAR, label="idle")
+    tr.ramp(0.4, FAR, 0.7, tape0=FAR, tape1=0.15)
+    tr.oscillate(rng.uniform(0.5, 3.0), center=0.7, amp=0.05, freq=rng.uniform(3, 5), tape=0.15, tape_amp=rng.uniform(0.08, 0.12), label="scratch")
+    tr.ramp(0.4, 0.7, FAR, tape0=0.15, tape1=FAR)
+    tr.hold(3.0, FAR, tape=FAR, label="idle")
+    return Scenario("cheek_scratch", tr.build(), max_state=State.WATCH, expect_final=State.IDLE, labels=tr.labels)
+
+
+def tape_then_tube_pull(rng: np.random.Generator) -> Scenario:
+    """Peel the tape, then grasp and pull the tube. WARN early (tape), ALARM on the pull."""
+    tr = Trajectory(rng)
+    tr.hold(2.0, FAR, tape=FAR, label="idle")
+    tr.ramp(0.5, FAR, 0.7, tape0=FAR, tape1=0.1)
+    tr.hold(rng.uniform(2.0, 4.0), 0.7, pinch=PINCH_GRIP, tape=0.1, label="tape")
+    tr.ramp(0.4, 0.7, 0.15, pinch=OPEN_HAND, tape0=0.1, tape1=0.5)
+    tr.hold(rng.uniform(1.7, 2.5), 0.15, pinch=PINCH_GRIP, tape=0.5, label="grasp")
+    tr.ramp(rng.uniform(0.5, 1.0), 0.15, 1.0, pinch=PINCH_GRIP, disp0=0.0, disp1=0.5, tape0=0.5, tape1=1.2, label="pull")
+    tr.hold(2.0, 1.0, pinch=PINCH_GRIP, disp=0.5, tape=1.2)
+    return Scenario("tape_then_tube_pull", tr.build(), must_reach=State.ALARM, expect_final=State.ALARM, labels=tr.labels)
+
+
 SCENARIOS: dict[str, Callable[[np.random.Generator], Scenario]] = {
+    "tape_pick": tape_pick,
+    "cheek_scratch": cheek_scratch,
+    "tape_then_tube_pull": tape_then_tube_pull,
     "idle": idle,
     "nose_scratch_short": nose_scratch_short,
     "long_face_rub": long_face_rub,

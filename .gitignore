@@ -8,4 +8,9 @@ data/
 clips/
 *.parquet
 *.mp4
+!sounds/*.wav
 .DS_Store
+models/
+logs/
+datasets/
+out/

@@ -5,23 +5,27 @@ Design: [stories/TS-001-initial-technical-spec.md](stories/TS-001-initial-techni
 
 ## Status
 
-Steps 1 and 2 of the build order are done: the pure state machine with its
-simulator and tests, and the capture pipeline with a live debug window.
-Perception (hand and face landmarks) is step 3, so the running app currently
-raises FAULT after five seconds: no perception means no confident view of the
-patient, and the system fails loud by design.
+All eight build-order steps of the Phase 1 prototype are implemented. What is
+**not** done, because it needs people and a camera: recording staged sessions
+(§7.3), tuning thresholds on them, and training the tube detector (§7.4–7.5).
+The tooling for each of those exists and is tested.
 
 | Module | Purpose |
 |--------|---------|
-| `src/nurse24hr/features.py` | Per-frame `Features` record (distance, pinch, oscillation, radial velocity, tube displacement, confidence) |
-| `src/nurse24hr/config.py` | `Thresholds` dataclass, loaded from `config.yaml` |
-| `src/nurse24hr/events.py` | `EventMachine`: IDLE → WATCH → WARN → ALARM / FAULT, latching, suppression, low-confidence hold |
-| `src/nurse24hr/simulate.py` | Scenario generator (idle, scratch, rub, grasp, pull, yank, caregiver, occlusion, dropout) and CLI |
-| `src/nurse24hr/capture.py` | Capture thread for webcam, file or RTSP into a size-one latest-frame slot; file clock for deterministic replay |
-| `src/nurse24hr/perception.py` | `Perceiver` interface plus the zero-confidence placeholder |
-| `src/nurse24hr/overlay.py` | Debug HUD: state banner, ROI, metrics, timers |
-| `src/nurse24hr/app.py` | Run loop and `nurse24hr` CLI |
-| `tests/` | Unit tests for the machine plus every scenario across many seeds |
+| `features.py` | Per-frame `Features` record: distance, pinch, oscillation, radial velocity, tube displacement, confidence |
+| `config.py` / `config.yaml` | `Thresholds` and every other setting, nothing hard-coded |
+| `events.py` | Pure state machine IDLE → WATCH → WARN → ALARM / FAULT: latching, hysteresis, suppression, low-confidence hold |
+| `simulate.py` | Synthetic scenario generator (idle, scratch, rub, grasp, pull, yank, caregiver, occlusion, dropout) |
+| `capture.py` | Capture thread for webcam, file or RTSP into a size-one latest-frame slot; file clock for deterministic replay |
+| `mp_perceiver.py` | MediaPipe hands + face landmarks → `Features` (v1 nostril proxy for the tube) |
+| `tube_detector.py` | Optional YOLO tube detector wrapper that replaces the proxy and computes tube displacement |
+| `alarm.py` | Alarm manager: levels, latching, sound, escalation, audit log |
+| `watchdog.py` | Camera loss, frozen frames, inference stall, heartbeat |
+| `recorder.py` | 10 s pre / 10 s post clips on WARN, ALARM, FAULT |
+| `notify.py` / `mqtt.py` / `web.py` | Notifier protocol, MQTT publisher with ack subscription, nurse web page with live state and ACK |
+| `features_log.py` / `replay.py` | Parquet logging; offline replay, metrics and threshold sweeps |
+| `session.py` | Staged recording protocol runner that writes video, features and script-derived labels |
+| `data/` | Frame sampling, seed labels, augmentation, YOLO training scaffold |
 
 ## Setup
 
@@ -30,36 +34,81 @@ uv sync
 uv run pytest
 ```
 
-## Try the simulator
+### Models
+
+MediaPipe model files are not committed. Download once:
 
 ```bash
-# outcome histogram for every scenario across 100 random seeds
-uv run python -m nurse24hr.simulate --n 100
-
-# event timeline for one scenario
-uv run python -m nurse24hr.simulate --scenario grasp_and_pull --seed 3
-uv run python -m nurse24hr.simulate --scenario nose_scratch_short --seed 3
-
-# with alternative thresholds
-uv run python -m nurse24hr.simulate --config config.yaml
+mkdir -p models
+curl -sSL -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+curl -sSL -o models/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+curl -sSL -o models/pose_landmarker_lite.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
 ```
 
-## Run the pipeline
+Note for Intel Macs: MediaPipe is pinned to 0.10.21, the last release with an
+x86_64 macOS wheel. Apple Silicon and Linux can use newer versions.
+
+## Run the monitor
 
 ```bash
-# live webcam with the debug window (macOS will ask for camera permission)
+# live webcam with the debug window (macOS asks for camera permission)
 uv run nurse24hr --source webcam
 
-# a recorded session, paced to real time, with a bed ROI
-uv run nurse24hr --source session.mp4 --roi 100,80,540,400
+# with the nurse page at http://127.0.0.1:8765
+uv run nurse24hr --source webcam --web
 
-# as fast as possible, no window, events on stdout
-uv run nurse24hr --source session.mp4 --headless --fast
+# a recorded session, paced to real time, logging features for later tuning
+uv run nurse24hr --source data/sessions/s01/video.mp4 --log out/s01.parquet
+
+# flat out, no window, events on stdout, no clips
+uv run nurse24hr --source session.mp4 --headless --fast --no-record
 ```
 
 Keys in the window: `q` quit, `a` acknowledge a latched ALARM or FAULT, space pause.
+With no perception (`--perceiver none`) the system raises FAULT after five
+seconds: no confident view of the patient, fail loud by design.
 
-## Next
+## Tune without a camera
 
-Step 3: perception producing `Features` from MediaPipe hands and face landmarks,
-with Parquet logging of every frame.
+```bash
+# every synthetic scenario across 100 seeds
+uv run python -m nurse24hr.simulate --n 100
+
+# one scenario's event timeline
+uv run python -m nurse24hr.simulate --scenario nose_scratch_short --seed 3
+
+# replay a logged session against its labels, then sweep thresholds
+uv run nurse24hr-replay out/s01.parquet --labels data/sessions/s01/labels.csv
+uv run nurse24hr-replay out/s01.parquet --labels data/sessions/s01/labels.csv \
+    --sweep t_grasp=1.0,1.5,2.0 --sweep osc_max=0.04,0.05,0.06
+```
+
+## Record staged sessions (needs volunteers)
+
+```bash
+uv run nurse24hr-session --dry-run                       # print the protocol schedule
+uv run nurse24hr-session --out data/sessions/s01 --subject alice --side left
+uv run nurse24hr-session --out data/sessions/s02 --blocks 2,6,7   # subset of blocks
+```
+
+Each session writes `video.mp4`, `features.parquet`, `labels.csv` (from the
+script, no manual annotation) and `session.json`.
+
+## Train the tube detector (needs sessions)
+
+```bash
+uv run python -m nurse24hr.data.sample_frames data/sessions/s01/video.mp4 data/sessions/s01/labels.csv datasets/tube/raw/s01
+# seed + review labels (see data/seed_labels.py docstring), split train/ and val/
+uv run python -m nurse24hr.data.augment datasets/tube/train datasets/tube/train_aug --n 4
+uv add ultralytics
+uv run python -m nurse24hr.data.train_tube --data datasets/tube --epochs 50 --model yolo11n.pt --device mps
+```
+
+Then set `perception.tube_weights` in `config.yaml` to the trained weights.
+
+## Sounds
+
+`sounds/alarm.wav` (two-tone siren) and `sounds/fault.wav` (low triple beep)
+are generated tones and are committed. WARN is silent at the bedside by
+default; set `alarm.warn_sound: sounds/warn.wav` in `config.yaml` for a soft
+chime. Replace any of them with your own WAV files.

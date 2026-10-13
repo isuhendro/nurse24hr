@@ -121,12 +121,31 @@ Models:
 | `v_wrist` | float or null | velocity of the closer wrist, normalized by `face_w` per second |
 | `v_radial` | float or null | component of wrist velocity **away from** `tube_pt` (positive = moving away). Pull signature. |
 | `pinch` | float or null | thumb-tip to index-tip distance / `face_w` for the closer hand. Small value = pinch grip. Scratching uses extended fingers; pulling uses a pinch. |
-| `osc` | float or null | wrist oscillation over the last 1 s (std-dev of `d` or zero-crossings of `v_radial`). High = scratching / rubbing. Low = static grasp. |
+| `osc` | float or null | the hand's own positional scatter over the last 1 s (std of the grip point in face-widths), not a distance to one anchor, so a cheek scratch looks as busy as a nose scratch. High = scratching / rubbing. Low = static grasp. |
 | `tube_disp` | float or null | displacement of `tube_pt` from its rolling baseline, normalized. Scratching does not move the tube; pulling does. |
+| `d_tape` | float or null | grip-point distance to the nearest **tape anchor** on the cheek (face landmarks 205 / 425), normalised. Picking at the securing tape is the usual precursor to a pull. |
 | `n_persons` | int | people detected inside bed ROI |
 | `conf` | float | 0–1 overall confidence of this frame |
 
 Smoothing: 5-frame median or EMA on `d` to suppress landmark jitter.
+
+**Pose first, face mesh second.** The face mesh alone is not a reliable "can I see the patient" signal: on the first real bedside clip (2026-10-11, ward lighting, patient seen from the side with tube and tape on the face) it failed for 10 s and produced a FAULT while the patient was plainly in view. The pose landmarker (full-range body model) found the patient in 114 of 118 frames of the same clip. Perception now runs pose on the bed ROI first: it answers patient-present, seeds the zoom crop with the head position, and when the face mesh fails it supplies coarse anchors (nose as tube point, nose–ear midpoints as tape points, ear-to-ear distance as face width) at confidence 0.7, plus wrist / index / thumb as coarse hands. FAULT therefore means nobody is visible at all. Cost: ~50 ms per frame extra on the Intel Mac (`pose_every_n` can halve it). Replaying that clip after the change: 117/118 confident frames, no FAULT.
+
+A second bedside clip (patient wearing a nebuliser mask, head ~6 % of frame width, handheld camera) still faulted: pose on the full frame found the patient in 1 of 6 sampled gap frames. Larger pose models (full, heavy) did not help. What did: running pose on a wide crop (~10 head-widths, min 512 px) around the last known head with the detection threshold lowered to 0.25, which found 5 of 6. Pose now has its own tracking crop with a full-ROI retry. Replay after the change: unseen frames fell from ~110 to 61 of 153, longest unseen stretch 1.9 s (below `T_FAULT`), no FAULT; the remaining unseen frames include the camera physically swinging away. The lite pose model is kept.
+
+**Range: tracking crop.** MediaPipe's face detector is short-range; a face that is a small patch of a wide frame is not found (observed live 2026-10-11 when the subject stepped back). Perception therefore runs on a crop: the static bed ROI when configured, and on top of that a tracking window of ~3 face-widths around the last seen face (digital zoom). If the face is lost inside the window the same frame is retried on the full ROI; after 1 s of misses the window is dropped. All landmarks are mapped back to full-frame pixels so the overlay, ROI and clips agree. For a ceiling camera over a whole bed the static ROI remains the primary tool; the tracking crop is what makes a 1280×720 frame usable at 2–3 m.
+
+**"Hand not seen" is not "hand away".** On the bedside clips the hand model drops out constantly at distance, and reporting a vanished hand as far away cut every reach short before the dwell could complete (14 WATCH episodes in 5 min, none reaching WARN, during movement the owner judged dangerous, 2026-10-11). A hand that vanishes now holds its last distance for 2 s at confidence 0.6 before being treated as away. Coarse hands and anchors from the pose model report `pinch` and `osc` as unknown (None), so the missing-evidence rule lets dwell alone raise WARN. Dwell timers hold rather than reset while the hand hovers between the grasp and watch bands.
+
+**Coarse hands alarm on nothing.** Bedside session 2026-10-11 14:00 (visitor leaning over the bed, patient's hands under the blanket or clasped at the chin) produced four ALARMs, all "grasp dwell" with no pinch / osc data. The hand model fired on 3 % of frames; every other frame used body-model wrists, which sat on the patient's face while the real hands were hidden (visibility just over the 0.3 cutoff) or 40 px off when they were clasped under the chin. The per-frame person count flipped between 1 and 2 some 230 times in three minutes, and suppression only gated the frame it was checked on while the dwell timers kept running, so the first single-person frame fired (audit: "ALARM suppressed, 2 persons" at 777088.89, ALARM at 777089.02). Three changes: the WARN-dwell ALARM now needs real grasp evidence seen at least once during the WARN (`missing_evidence_alarms`, default false; dwell alone still raises WARN); after a second person was seen the count must read one for `t_single_person` (1.5 s) before escalation and the WARN clock does not advance while suppressed; the WARN clock resets once the hand has been outside the watch band for `t_warn_reset` (1 s). Body-model hands need visibility 0.5 (`pose_hand_min_vis`). Replaying all nine logged runs: the 14:00 run goes from 4 ALARMs to 0 and 9 WARNs to 3; the morning runs keep their pinch-backed ALARMs (4 of 5) and lose 27 of 37 WARNs. Open: the hand-model hit rate itself (3 to 20 % at this distance) is the real limiter and has not been addressed.
+
+**Whose face is it.** Live session 2026-10-12 00:29: a visitor's back and head filled the frame, the face / pose models tracked the visitor as the patient, body-model wrists dwelt at the visitor's nose and the machine alarmed ("grasp dwell 3.7s") while the patient was not in the picture at all. Nothing distinguished faces. Perception now keeps a size baseline of the accepted face-mesh width and rejects a face more than `face_scale_max` (1.6) times larger or smaller: a visitor leaning in is two to four times the patient's width (replaying the clip: 230-300 px against a 105 px patient). Among accepted faces the one nearest the tracked head wins. The body model's ear-to-ear width is not usable as a cue (2 to 77 px on one person in a profile view), so a pose is rejected by position instead: its nose inside a mesh face rejected within the last second (`reject_memory_s`). A masked visitor the mesh never sees is therefore still not caught. A rejected face still counts as a person, and while one is in view the deriver does not measure hands against the remembered anchor (those are the visitor's hands). With no accepted face for `face_relearn_s` (30 s) the baseline is dropped so a moved camera recovers. A visitor hiding the patient therefore ends in FAULT, which is an alarm, not a silence.
+
+**Hand model at distance.** Experiment on the 2026-10-11 clips (patient face ~100 px wide in 1280x720, ward light): the MediaPipe hand landmarker found a hand in 9-11 % of frames of the clasped-hands clip and 3-9 % of the blanket clip, whichever way it was run: VIDEO or IMAGE mode, face crop at 3x or 5x, full frame, detection confidence 0.4 or 0.2, or a tight 1.5-3x crop centred on each body-model wrist (the usual pose-to-hand trick). Cropping is not the limiter; the model is. Until a better hand detector is in (RTMPose / YOLO-pose whole-body, or a hand detector fine-tuned on bedside views), coarse body-model hands carry the proximity logic and WARN is the ceiling without pinch / osc evidence.
+
+**Repeated reaching.** A patient who keeps bringing a hand to the face is agitated and at risk even if no single reach lasts 1.5 s. Three entries into WATCH within 60 s raise WARN ("repeated reaching"); `reach_count_warn` / `reach_window_s`, 0 disables.
+
+**Hand-over-face occlusion.** A hand at the nose hides the landmarks the face model needs, so the grasp we most care about can blind the tube anchor. When the face drops out but a hand is still visible within 10 s of the last good face, perception keeps measuring against the remembered anchor at confidence 0.6 (above `CONF_MIN`), so dwell keeps accumulating. With no hand visible either, confidence is 0 and FAULT follows as before. Observed on the first live webcam run (2026-10-11).
 
 **v1 insertion-point proxy.** Without a tube detector, `tube_pt` is the nostril region from face landmarks for an NG tube. Note that a nose scratch then lands right on `tube_pt`, so §5.3 must not alarm on proximity and dwell alone.
 
@@ -148,6 +167,8 @@ any   → IDLE  : d > D_RELEASE for > T_RELEASE         (hysteresis)
 ALARM          : latched; only an explicit ack returns to IDLE
 ```
 
+**Tape on the cheek.** The tube is secured with tape on the cheek, and patients pick at it before pulling. A still or pinched hand dwelling at `d_tape < D_GRASP` for `T_GRASP` raises WARN ("hand at tape"). It never reaches ALARM on its own: WARN dwell and pull motion are tied to the tube anchor, and pull motion is only armed within `PULL_ARM_S` of the hand being at the tube, so a pinched hand leaving the cheek is not a pull. Hysteresis back to IDLE requires the hand to be away from both anchors. Added 2026-10-11 after the first live test.
+
 **Scratch vs pull.** A face scratch and a tube grasp both put the hand at `tube_pt`. They differ in three measurable ways, and the machine uses all three:
 
 | Signal | Scratch / rub | Grasp and pull |
@@ -156,7 +177,7 @@ ALARM          : latched; only an explicit ack returns to IDLE
 | Hand motion | high-frequency oscillation (`osc` high), fingers extended (`pinch` large) | still hand, pinch grip (`pinch` small), then one radial move away (`v_radial` > 0) |
 | Tube | `tube_disp` ≈ 0 | `tube_disp` grows with the hand |
 
-Expected behaviour: a scratch reaches WATCH, occasionally WARN if the patient rubs for a long time, and never ALARM unless the tube actually moves. In v1 WARN is a **station-only notification, no bedside sound**, so a long scratch does not disturb the patient. The bedside chime on WARN is a later config option once false-WARN rate is known.
+Expected behaviour: a scratch reaches WATCH, occasionally WARN if the patient rubs for a long time, and never ALARM unless the tube actually moves. WARN plays a **soft, single bedside chime** (`sounds/warn.wav`, not looped) plus the station notification; set `alarm.warn_sound: null` for station-only if the false-WARN rate turns out to disturb patients. (Changed 2026-10-11 from station-only at the owner's request during live testing.)
 
 Default thresholds (config, to be tuned on recorded sessions):
 
@@ -183,13 +204,14 @@ Rules:
 - **Tube displacement alarms from any non-latched state**, including IDLE, since the tube moving away from baseline is strong evidence regardless of whether a hand was tracked.
 - Per-frame `dt` is capped at `MAX_DT` (0.5 s) so a stalled pipeline never jumps a timer.
 - The module exposes `step(features) -> events` and holds all timers internally. It must be deterministic given the same feature sequence.
+- **Ack resets the tube baseline.** After a nurse acknowledges, the detector baseline restarts (the tube has been re-seated); otherwise a still-displaced tube re-alarms immediately. Replay emulates this by rebasing `tube_disp` at ack time.
 - Implemented in `src/nurse24hr/events.py`; scenarios in `src/nurse24hr/simulate.py`; tests in `tests/`. Known v1 gap, recorded as an expected failure in the suite: a sub-1.5 s yank without a tube detector is indistinguishable from a brief touch.
 
 ### 5.4 Alarm manager (`alarm.py`)
 
 | Level | Local | Remote | Escalation |
 |-------|-------|--------|------------|
-| WARN  | none in v1 (soft chime is a config option) | nurse-station notification | none |
+| WARN  | soft single chime (config: `warn_sound`, null = silent) | nurse-station notification | none |
 | ALARM | loud continuous alarm | push to nurse call / phone | re-notify if no ack in 30 s, then escalate to secondary |
 | FAULT | distinct fault tone | notification with fault reason | same as ALARM |
 
@@ -264,6 +286,9 @@ A small simulator `simulate.py` generates `Features` time series directly, bypas
 | fast yank | 0.1 for 0.5 s, then rising fast | low | small | large + | rising | ALARM |
 | caregiver adjust (`n_persons = 2`) | 0.1–0.2 for 5–20 s | low | small | ± | small | WATCH, suppressed |
 | blanket over face | `conf` drops to 0.1 for > 5 s | — | — | — | — | FAULT |
+| tape pick (`d_tape` 0.1, `d` 0.7) | 0.7 | low | small | ± | 0 | WARN, never ALARM |
+| cheek scratch at tape | 0.7, `d_tape` oscillating | high | large | ± | 0 | WATCH |
+| tape peel then tube pull | tape first, then 0.15, then rising | low | small | + | rising | WARN then ALARM |
 | landmark dropout | `conf` flickers 0.2–0.9 at 2 Hz during a grasp | low | small | 0 | 0 | WARN (state must hold) |
 
 Thousands of sequences run through `events.py` in seconds. This is the unit-test suite for the state machine and the first threshold sweep. It cannot tell us real-world recall, but it guarantees the logic is correct and that scratches do not alarm by construction.
@@ -281,6 +306,7 @@ Recording protocol. Each session follows a timed script read aloud or shown on s
 | 3 | rub face with palm, wipe mouth | 10 | `rub` |
 | 4 | adjust pillow, pull blanket up, roll over | 10 | `other` |
 | 5 | touch the tube without gripping | 10 | `touch` |
+| 10 | pick at / peel the tape on the cheek | 10 | `tape` |
 | 6 | pinch and hold the tube 2–4 s, release | 10 | `grasp` |
 | 7 | pinch and pull the tube out (tape re-applied each time) | 10 | `pull` |
 | 8 | second person adjusts the tube | 5 | `caregiver` |
@@ -335,12 +361,12 @@ Real patients differ from volunteers: tremor, restless sleep, confusion, restrai
 
 1. ~~`events.py` + `simulate.py` + pytest suite (§7.2). No camera needed. Scratch-vs-pull logic proven here first.~~ **Done 2026-10-11.**
 2. ~~Capture + debug overlay, webcam and file sources.~~ **Done 2026-10-11.** `capture.py`, `overlay.py`, `app.py`, `Perceiver` interface with a zero-confidence placeholder so the pipeline fails loud (FAULT) until step 3 lands.
-3. Perception → `Features` (incl. `pinch`, `osc`, `v_radial`), Parquet logging.
-4. Staged recording sessions (§7.3); replay their features through `events.py`; first real threshold tuning.
-5. Alarm manager + watchdog.
-6. Auto-label pipeline (§7.4) + augmentation (§7.5) → train YOLO-nano tube detector → replaces face-landmark proxy, enables `tube_disp`.
-7. Clip recorder.
-8. MQTT publish + minimal nurse client (web page or iPhone).
+3. ~~Perception → `Features` (incl. `pinch`, `osc`, `v_radial`), Parquet logging.~~ **Done 2026-10-11.** `mp_perceiver.py` (MediaPipe Tasks hands + face, VIDEO mode), `features_log.py`. Deviation: `d` uses the grip point (midpoint of thumb and index tips) rather than the wrist, so `d` and `pinch` refer to the same location; wrists are still logged.
+4. Staged recording sessions (§7.3); replay their features through `events.py`; first real threshold tuning. **Tooling done 2026-10-11** (`session.py` protocol runner, `replay.py` metrics and sweeps). **Recording and tuning still require volunteers and a camera.**
+5. ~~Alarm manager + watchdog.~~ **Done 2026-10-11.** `alarm.py`, `watchdog.py`. Watchdog runs in its own thread and is edge-triggered; the separate-process variant is still open for Phase 3.
+6. Auto-label pipeline (§7.4) + augmentation (§7.5) → train YOLO-nano tube detector → replaces face-landmark proxy, enables `tube_disp`. **Scaffolding done 2026-10-11** (`data/sample_frames.py`, `data/seed_labels.py` with a SAM hook, `data/augment.py`, `data/train_tube.py`, `tube_detector.py` wrapper). **Training requires sampled frames from step 4.**
+7. ~~Clip recorder.~~ **Done 2026-10-11.** `recorder.py`, one clip per incident with a JSON sidecar.
+8. ~~MQTT publish + minimal nurse client (web page or iPhone).~~ **Done 2026-10-11.** `mqtt.py` (topics per §6, ack subscription), `web.py` (stdlib HTTP + SSE page with ACK and beep).
 
 ## 10. Platform notes
 
@@ -359,6 +385,7 @@ Python 3.12 for everything in this spec through Phase 2.
 - `cv2.imshow` must run on the main thread. Run headless when not debugging.
 - Grant camera permission to Terminal / IDE.
 - `mps` backend for YOLO; MediaPipe on CPU.
+- Intel Macs: MediaPipe pinned to 0.10.21 (last x86_64 wheel), which forces NumPy 1.x and pyarrow < 19. Measured ~60 ms per frame for hands + face on a blank 640×480 frame, right at the 15 fps budget; the capture slot drops frames if inference falls behind.
 - iPhone via Continuity Camera is a drop-in better webcam.
 
 **iPhone (if Option A is used for a demo)**

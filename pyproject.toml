@@ -4,13 +4,23 @@ version = "0.1.0"
 description = "Camera-based feeding-tube pull-out monitor."
 requires-python = ">=3.12"
 dependencies = [
+    "mediapipe==0.10.21",
     "numpy>=1.26",
     "opencv-python>=4.10",
+    "paho-mqtt>=2.1.0",
+    "pyarrow<19",
     "pyyaml>=6.0",
 ]
 
 [project.scripts]
 nurse24hr = "nurse24hr.app:main"
+nurse24hr-replay = "nurse24hr.replay:main"
+nurse24hr-session = "nurse24hr.session:main"
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
 
 [dependency-groups]
 dev = [

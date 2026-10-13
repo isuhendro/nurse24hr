@@ -64,10 +64,30 @@ def test_warn_before_t_grasp_does_not_fire():
     assert State.WARN not in seq
 
 
-def test_grasp_dwell_resets_when_hand_leaves_grasp_band():
-    # 1 s at tube, 0.5 s just outside, 1 s at tube: never 1.5 s continuous
+def test_grasp_dwell_holds_in_watch_band_and_resets_outside_it():
+    # 1 s at tube, 0.5 s hovering just outside the grasp band, 1 s at tube: dwell held -> WARN
     seq = states(frames([(1, {"d": 1.8}), (1, {"d": 0.2}), (0.5, {"d": 0.45}), (1, {"d": 0.2})]))
+    assert seq[-1] is State.WARN
+    # same but the hand goes beyond the watch band in between: dwell reset -> no WARN
+    seq = states(frames([(1, {"d": 1.8}), (1, {"d": 0.2}), (0.5, {"d": 0.7}), (1, {"d": 0.2})]))
     assert State.WARN not in seq
+
+
+def test_repeated_reaching_raises_warn():
+    reach = [(1.0, {"d": 0.5}), (3.0, {"d": 1.8})]  # in, then away long enough to return to IDLE
+    seq = states(frames([(1, {"d": 1.8})] + reach * 3))
+    assert State.WARN in seq
+    idx = seq.index(State.WARN)
+    # fires on the third entry, not earlier
+    assert idx * DT >= 1 + 2 * 4.0 - DT
+    th = Thresholds(reach_count_warn=0)
+    assert State.WARN not in states(frames([(1, {"d": 1.8})] + reach * 5), th)
+
+
+def test_repeated_reaching_window_expires():
+    th = Thresholds(reach_window_s=5.0)
+    reach = [(1.0, {"d": 0.5}), (5.0, {"d": 1.8})]  # 6 s per cycle > window
+    assert State.WARN not in states(frames([(1, {"d": 1.8})] + reach * 4), th)
 
 
 def test_warn_to_alarm_by_dwell():
@@ -191,6 +211,52 @@ def test_missing_evidence_defaults_to_counting():
     assert seq[-1] is State.WATCH
 
 
+# ------------------------------------------------------------ tape on the cheek
+
+def test_hand_dwelling_at_tape_raises_warn_but_never_alarm():
+    seq = states(frames([(1, {"d": 1.8, "d_tape": 1.8}), (8, {"d": 0.7, "d_tape": 0.1, "pinch": 0.05})]))
+    assert State.WARN in seq
+    assert State.ALARM not in seq
+    assert seq[-1] is State.WARN
+
+
+def test_tape_warn_needs_grasp_evidence():
+    # scratching at the cheek: oscillating, open fingers -> WATCH only
+    seq = states(frames([(1, {"d": 1.8, "d_tape": 1.8}), (4, {"d": 0.7, "d_tape": 0.1, "osc": 0.09, "pinch": 0.4})]))
+    assert seq[-1] is State.WATCH and State.WARN not in seq
+
+
+def test_pinched_hand_leaving_tape_is_not_a_pull():
+    seq = states(frames([
+        (1, {"d": 1.8, "d_tape": 1.8}),
+        (3, {"d": 0.7, "d_tape": 0.1, "pinch": 0.05}),                       # WARN from tape
+        (0.3, {"d": 1.2, "d_tape": 0.8, "pinch": 0.05, "v_radial": 2.0}),   # fast move away, still pinched
+        (3, {"d": 1.8, "d_tape": 1.8}),
+    ]))
+    assert State.WARN in seq and State.ALARM not in seq
+    assert seq[-1] is State.IDLE
+
+
+def test_pull_is_still_caught_right_after_leaving_the_tube():
+    seq = states(frames([
+        (1, {"d": 1.8}),
+        (2, {"d": 0.2, "pinch": 0.05}),
+        (0.2, {"d": 0.5, "pinch": 0.05, "v_radial": 2.0}),  # within pull_arm_s of being at the tube
+    ]))
+    assert seq[-1] is State.ALARM
+
+
+def test_release_requires_hand_away_from_tape_too():
+    seq = states(frames([(1, {"d": 1.8, "d_tape": 1.8}), (1, {"d": 0.5, "d_tape": 0.5}), (4, {"d": 1.5, "d_tape": 0.5})]))
+    assert seq[-1] is State.WATCH  # still at the tape, so no hysteresis reset
+
+
+def test_tape_logic_can_be_disabled():
+    th = Thresholds(tape_warn=False)
+    seq = states(frames([(1, {"d": 1.8, "d_tape": 1.8}), (8, {"d": 1.8, "d_tape": 0.1, "pinch": 0.05})]), th)
+    assert seq[-1] is State.IDLE
+
+
 # ------------------------------------------------------------ suppression
 
 def test_second_person_suppresses_warn_and_alarm_but_logs_it():
@@ -208,7 +274,87 @@ def test_suppression_lifts_when_caregiver_leaves():
         (3, {"d": 0.2, "pinch": 0.05, "n_persons": 2}),
         (0.5, {"d": 0.2, "pinch": 0.05, "n_persons": 1}),
     ]))
+    assert seq[-1] is State.WATCH, "count must read one for t_single_person first"
+    seq = states(frames([
+        (1, {"d": 1.8, "n_persons": 2}),
+        (3, {"d": 0.2, "pinch": 0.05, "n_persons": 2}),
+        (TH.t_single_person + 0.2, {"d": 0.2, "pinch": 0.05, "n_persons": 1}),
+    ]))
     assert seq[-1] is State.WARN
+
+
+def test_flickering_person_count_keeps_suppressing():
+    # A caregiver leaning over the bed: the per-frame count alternates 2, 1, 2, 1 ...
+    fs = frames([(1, {"d": 1.8})])
+    t = fs[-1].t
+    for i in range(15 * 10):
+        t += DT
+        fs.append(Features(t=t, d=0.2, conf=0.95, n_persons=2 if i % 2 else 1, pinch=0.05, osc=0.0))
+    m, evs = run(fs)
+    assert m.state is State.WATCH
+    assert all(e.kind == "suppressed" for e in evs if e.state in (State.WARN, State.ALARM))
+    assert "second person seen" in next(e.reason for e in evs if e.kind == "suppressed")
+
+
+def test_warn_dwell_does_not_advance_while_suppressed():
+    th = Thresholds(t_single_person=0.0)  # isolate the clock from the debounce
+    seq = states(frames([
+        (1, {"d": 1.8}),
+        (2, {"d": 0.2, "pinch": 0.05}),              # -> WARN
+        (5, {"d": 0.2, "pinch": 0.05, "n_persons": 2}),  # caregiver at the tube: clock frozen
+        (2, {"d": 0.2, "pinch": 0.05}),              # alone again, 2 s < t_alarm
+    ]), th)
+    assert seq[-1] is State.WARN
+    seq2 = states(frames([
+        (1, {"d": 1.8}),
+        (2, {"d": 0.2, "pinch": 0.05}),
+        (5, {"d": 0.2, "pinch": 0.05, "n_persons": 2}),
+        (TH.t_alarm + 0.3, {"d": 0.2, "pinch": 0.05}),
+    ]), th)
+    assert seq2[-1] is State.ALARM
+
+
+def test_person_debounce_can_be_disabled():
+    th = Thresholds(t_single_person=0.0)
+    seq = states(frames([
+        (1, {"d": 1.8, "n_persons": 2}),
+        (3, {"d": 0.2, "pinch": 0.05, "n_persons": 2}),
+        (0.2, {"d": 0.2, "pinch": 0.05, "n_persons": 1}),
+    ]), th)
+    assert seq[-1] is State.WARN
+
+
+# ------------------------------------------------------------ missing evidence and the ALARM clock
+
+def test_dwell_alarm_needs_real_evidence_at_least_once():
+    none = {"d": 0.2, "osc": None, "pinch": None}
+    m, evs = run(frames([(1, {"d": 1.8}), (8, none)]))
+    assert m.state is State.WARN, "WARN by dwell alone, but no ALARM on coarse hands"
+    held = [e for e in evs if e.kind == "suppressed"]
+    assert len(held) == 1 and "ALARM held" in held[0].reason
+    # one real pinch reading during the WARN is enough
+    seq = states(frames([(1, {"d": 1.8}), (3, none), (0.2, {"d": 0.2, "pinch": 0.05, "osc": None}), (4, none)]))
+    assert seq[-1] is State.ALARM
+    # the old behaviour is still available
+    seq = states(frames([(1, {"d": 1.8}), (8, none)]), Thresholds(missing_evidence_alarms=True))
+    assert seq[-1] is State.ALARM
+
+
+def test_warn_dwell_resets_after_hand_leaves_watch_band():
+    seq = states(frames([
+        (1, {"d": 1.8}),
+        (2, {"d": 0.2, "pinch": 0.05}),      # WARN, ~0.5 s of dwell
+        (TH.t_warn_reset + 0.3, {"d": 0.7}),  # out of the watch band, not far enough for release
+        (2.3, {"d": 0.2, "pinch": 0.05}),    # back: fresh clock, 2.3 s < t_alarm
+    ]))
+    assert seq[-1] is State.WARN
+    seq = states(frames([
+        (1, {"d": 1.8}),
+        (2, {"d": 0.2, "pinch": 0.05}),      # ~0.5 s of WARN dwell
+        (0.5, {"d": 0.7}),                   # brief excursion keeps the clock
+        (2.8, {"d": 0.2, "pinch": 0.05}),    # 0.5 + 2.8 > t_alarm
+    ]))
+    assert seq[-1] is State.ALARM
 
 
 # ------------------------------------------------------------ robustness

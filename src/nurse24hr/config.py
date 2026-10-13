@@ -34,13 +34,32 @@ class Thresholds:
 
     max_dt: float = 0.5
     missing_evidence_counts: bool = True
+    """If osc and pinch are both unavailable, dwell alone may raise WARN (favours recall)."""
+    missing_evidence_alarms: bool = False
+    """If true the WARN-dwell ALARM also fires with no pinch / osc data ever seen. Off by default:
+    coarse body-model hands drift onto the face when the real hands are hidden, and dwell alone
+    then alarms on nothing (bedside false alarms, 2026-10-11)."""
+    t_single_person: float = 1.5
+    """After a second person was seen, the count must read one for this long before WARN / ALARM
+    may fire. The per-frame count flickers while a caregiver leans over the bed. 0 disables."""
+    t_warn_reset: float = 1.0
+    """In WARN, the hand outside the watch band for this long resets the ALARM dwell clock."""
+    tape_warn: bool = True
+    """A still or pinched hand dwelling at the cheek tape raises WARN (never ALARM by itself)."""
+    pull_arm_s: float = 0.5
+    """Pull motion only counts if the hand was at the tube within this many seconds."""
+    reach_count_warn: int = 3
+    """Entries into WATCH within ``reach_window_s`` that raise WARN ("repeated reaching"). 0 disables."""
+    reach_window_s: float = 60.0
 
     def __post_init__(self) -> None:
         if not (self.d_grasp < self.d_watch < self.d_release):
             raise ValueError("require d_grasp < d_watch < d_release for hysteresis")
-        for name in ("t_grasp", "t_alarm", "t_release", "t_fault", "max_dt"):
+        for name in ("t_grasp", "t_alarm", "t_release", "t_fault", "max_dt", "t_warn_reset"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.t_single_person < 0:
+            raise ValueError("t_single_person must be >= 0")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Thresholds:

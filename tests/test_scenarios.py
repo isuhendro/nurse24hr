@@ -11,8 +11,8 @@ from nurse24hr.simulate import SCENARIOS, Trajectory, check, generate, run_scena
 import numpy as np
 
 SEEDS = range(40)
-NEGATIVE = ["idle", "nose_scratch_short", "long_face_rub", "wipe_mouth", "caregiver_adjust"]
-POSITIVE = ["grasp_and_pull", "fast_yank"]
+NEGATIVE = ["idle", "nose_scratch_short", "long_face_rub", "wipe_mouth", "caregiver_adjust", "tape_pick", "cheek_scratch"]
+POSITIVE = ["grasp_and_pull", "fast_yank", "tape_then_tube_pull"]
 
 
 @pytest.mark.parametrize("seed", SEEDS)
