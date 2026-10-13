@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 dist/
 *.egg-info/
-data/
+/data/
 clips/
 *.parquet
 *.mp4
@@ -12,5 +12,6 @@ clips/
 .DS_Store
 models/
 logs/
+*.jsonl
 datasets/
 out/

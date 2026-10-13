@@ -3,6 +3,24 @@
 Camera-based monitor that alarms when a patient attempts to pull out a feeding tube.
 Design: [stories/TS-001-initial-technical-spec.md](stories/TS-001-initial-technical-spec.md).
 
+> ## Warning: not a medical device. Use at your own risk.
+>
+> This is an experimental prototype. It has **not** been tested, validated,
+> certified or approved as a medical device by any regulatory body, and it has
+> not been evaluated in a clinical study. It is not a substitute for clinical
+> observation, nursing care, or any approved patient-monitoring equipment.
+>
+> It will miss events and it will raise false alarms. On the first bedside
+> sessions it alarmed on a visitor leaning over the bed and on hands hidden
+> under a blanket, and its hand tracking sees the hand in roughly one frame in
+> ten at ward distances. Treat every output as a hint for a human to check,
+> never as a reason to look away from the patient.
+>
+> Use it only with the informed consent of the patient or their legal
+> representative, in line with local law on video recording and patient
+> privacy. The authors accept no liability for any harm, injury, loss or
+> damage arising from its use. You use it entirely at your own risk.
+
 ## Status
 
 All eight build-order steps of the Phase 1 prototype are implemented. What is
@@ -109,6 +127,6 @@ Then set `perception.tube_weights` in `config.yaml` to the trained weights.
 ## Sounds
 
 `sounds/alarm.wav` (two-tone siren) and `sounds/fault.wav` (low triple beep)
-are generated tones and are committed. WARN is silent at the bedside by
-default; set `alarm.warn_sound: sounds/warn.wav` in `config.yaml` for a soft
-chime. Replace any of them with your own WAV files.
+are generated tones and are committed, as is `sounds/warn.wav`, a soft chime
+played at the bedside on WARN. Set `alarm.warn_sound: null` in `config.yaml`
+for a station-only WARN. Replace any of them with your own WAV files.
