@@ -50,15 +50,27 @@ perception:
   pose_every_n: 1     # run pose on every n-th frame (most expensive stage)
   pose_detection_confidence: 0.25   # lower than the face threshold; a small masked patient needs it
   pose_hand_min_vis: 0.5            # body-model wrist/index visibility needed to count as a coarse hand; low-visibility points sit on the face when the hands are under the blanket
+  hand_corroborate_s: 1.5   # a hand-model hand near the tube counts only if the body model saw a wrist within a face width of it in the last this many seconds. The hand model draws whole phantom hands along a cheek (false WARNs 2026-10-16); the body model never put a wrist there, and did for every real grasp. 0 = hand model alone (more recall, more ghosts)
+  hand_min_len: 0.45  # a hand-model hand shorter than this many face widths (wrist to fingertip) is dropped: on a distant patient the model hallucinates 0.1-0.3 wide "hands" on the taped tube and gown collar (false WARNs 2026-10-16); real hands reaching a tube measure 0.5-1.3
   tube_side: center   # center (subnasale) | left | right  -- subject's side the NG tube is taped to
   tape_side: null     # null = same as tube_side; center = both cheeks. Where the securing tape sits.
   num_hands: 4
-  num_faces: 2
+  num_faces: 3        # heads the face model may return per frame; also the most that can be listed for patient selection
   tube_weights: null  # path to a trained YOLO tube detector (.pt); null = v1 nostril proxy only
   auto_zoom: true     # track the face and run detection on a crop around it (digital zoom for far cameras)
   face_scale_max: 1.6 # a face this many times larger/smaller than the tracked patient's is someone else (visitor leaning in); 0 disables
   face_relearn_s: 30  # no accepted face for this long drops the size baseline (camera moved)
-  min_detection_confidence: 0.4
+  patient_file: state/patient.json  # the selected patient (position, head tilt) is saved here and restored at the next start; null = forget on exit
+  relock_radius: 4.0  # once the locked patient has been lost for ~2 s, a head within this many face widths that lies the same way and passes the size gate is the patient again (camera nudged 140 px -> minutes of FAULT, 2026-10-16); a visitor leaning in is upright and larger, so still rejected
+  lock_radius: 2.0    # after a patient is selected (click / 1-9 / nurse page), only a head within this many face widths of where they were last seen is the patient; 0 = size check only
+  survey_every_s: 1.0 # background scan of the whole bed for other people this often (~100 ms each on a laptop with 640 px tiles); 0 disables, s in the window scans every frame
+  survey_rotations: [0, 90, 270]  # the scan also looks at the frame turned on its side, so a patient lying sideways is found (needed below ~100 px face width); [0] = upright only
+  survey_cycle: true  # one rotation per scan, round robin (all orientations covered every 3 s); false = all rotations every scan, 3x the cost
+  survey_pose: true   # include the body model in the scan (finds a masked or turned-away head the face mesh misses)
+  survey_tile_px: 640 # the scan looks at the bed in overlapping tiles this big: the face detector shrinks its input to 128 px, so on a whole 1280 px frame a face under ~150 px (a patient 2-3 m away) is never found; 640 px tiles find faces down to ~70 px. 0 = whole frame (cheaper, near faces only)
+  min_detection_confidence: 0.4   # face and body
+  hand_detection_confidence: 0.6  # hands are stricter: at 0.4/0.5 the hand model kept a ghost hand on the nose and cheek for 10 s after the real hands left (false WARN 2026-10-16)
+  hand_tracking_confidence: 0.8
 
 alarm:
   warn_sound: sounds/warn.wav   # soft chime at the bedside on WARN; set to null for station-only
@@ -70,7 +82,7 @@ alarm:
 watchdog:
   camera_loss_s: 2.0
   frozen_s: 5.0
-  stall_s: 2.0
+  stall_s: 5.0        # no processed frame for this long = inference stall FAULT. 2.0 fired four times in 12 s on 2026-10-16 while the window was being handled (the loop runs at 5-8 fps on a laptop with 1 s hiccups); 5 s matches t_fault
   heartbeat_s: 10.0
 
 recorder:

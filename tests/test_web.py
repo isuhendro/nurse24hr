@@ -120,3 +120,38 @@ def test_stop_terminates_server_and_open_streams():
     assert resp.readline() == b""  # server closed the stream
     with pytest.raises((urllib.error.URLError, ConnectionError, OSError)):
         get(client.url, timeout=1)
+
+
+def post(web, path, body):
+    req = urllib.request.Request(web.url + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    return get(req)
+
+
+def test_post_select_reaches_on_select_callbacks(web):
+    got = []
+    web.on_select(got.append)
+    with post(web, "select", {"n": 2}) as r:
+        assert json.loads(r.read())["n"] == 2
+    with post(web, "select", {"n": 0}):
+        pass
+    with post(web, "select", {"survey": True}) as r:
+        assert json.loads(r.read())["survey"] is True
+    assert [g.get("n", g.get("survey")) for g in got] == [2, 0, True]
+    assert web.test_acks == [], "selection is not an ack"
+
+
+def test_post_select_rejects_nonsense(web):
+    got = []
+    web.on_select(got.append)
+    for body in ({}, {"n": -1}, {"n": "2"}, {"n": 2.5}, {"n": True}):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            post(web, "select", body)
+        assert exc.value.code == 400
+    assert got == []
+
+
+def test_index_page_has_patient_selector(web):
+    with get(web.url) as r:
+        body = r.read().decode()
+    assert 'id="people"' in body and "/select" in body

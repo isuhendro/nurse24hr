@@ -5,7 +5,10 @@ notifications it gives the console or MQTT, and it fans them out to every
 open browser over Server-Sent Events. The page shows the bed state, recent
 events and heartbeat age, beeps while ALARM / FAULT is latched, and has an
 ACK button that POSTs to ``/ack``; the registered ``on_ack`` callback then
-acknowledges the state machine and alarm manager.
+acknowledges the state machine and alarm manager. When the state feed carries
+``people`` / ``patient`` / ``locked`` it also shows who is being followed, with
+one button per head in view (numbered left to right) and an "auto" button;
+those POST to ``/select`` and reach the ``on_select`` callbacks.
 
 Why in-process rather than via the broker: the prototype must work on a
 laptop with no MQTT running, and the nurse station is the same machine for
@@ -41,6 +44,10 @@ h1{margin:0 0 8px;font-size:1.1rem;color:var(--muted)}
 #hb{font-size:.9rem;color:var(--muted);margin-bottom:14px}
 #hb.stale{color:var(--alarm);font-weight:600}
 .row{display:flex;gap:8px;margin-bottom:16px}
+#people{font-size:.9rem;color:var(--muted);margin-bottom:14px}
+#people .btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+#people button{flex:0 0 auto;padding:8px 14px;font-size:1rem;background:#333;color:var(--fg)}
+#people button.on{background:#c0c;color:#fff}
 input{flex:1;padding:14px;font-size:1rem;border-radius:8px;border:1px solid #444;background:#222;color:var(--fg)}
 button{flex:0 0 40%;padding:14px;font-size:1.2rem;font-weight:700;border:0;border-radius:8px;background:#eee;color:#111}
 button:disabled{opacity:.4}
@@ -52,6 +59,7 @@ li time{color:var(--muted);margin-right:8px}
 <div id="state">&mdash;</div>
 <div id="reason"></div>
 <div id="hb">no heartbeat yet</div>
+<div id="people"></div>
 <div class="row"><input id="user" placeholder="nurse name"><button id="ack" disabled>ACK</button></div>
 <ul id="events"></ul>
 <script>
@@ -72,8 +80,20 @@ document.addEventListener('pointerdown',()=>{if(!armed){armed=true;if(state==='A
 function addEvent(p){const li=document.createElement('li');const t=new Date().toLocaleTimeString();
   li.innerHTML='<time>'+t+'</time>'+(p.level||p.kind||p.topic||'')+' '+(p.reason||p.summary||'')+(p.user?' by '+p.user:'');
   const ul=$('events');ul.insertBefore(li,ul.firstChild);while(ul.children.length>20)ul.removeChild(ul.lastChild)}
+let people=null;
+function renderPeople(p){
+  const key=JSON.stringify([p.people,p.patient,p.locked,p.survey]);if(key===people)return;people=key;
+  const el=$('people');if(p.people===undefined){el.innerHTML='';return}
+  const who=p.patient?('#'+p.patient):'not visible';
+  let html='patient '+who+' ('+(p.locked?'locked':'auto')+') &middot; '+p.people+' in view'+(p.survey?' &middot; scanning whole bed':'')+'<div class="btns">';
+  for(let i=1;i<=p.people;i++)html+='<button data-n="'+i+'" class="'+(i===p.patient&&p.locked?'on':'')+'">'+i+'</button>';
+  html+='<button data-n="0" class="'+(p.locked?'':'on')+'">auto</button><button data-survey="1">'+(p.survey?'stop scan':'find all')+'</button></div>';
+  el.innerHTML=html;
+  el.querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>post('/select',{n:+b.dataset.n}));
+  const sv=el.querySelector('button[data-survey]');if(sv)sv.onclick=()=>post('/select',{survey:!p.survey})}
+function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
 function handle(p){
-  if(p.topic==='state'){setState(p.state,undefined)}
+  if(p.topic==='state'){setState(p.state,undefined);renderPeople(p)}
   else if(p.topic==='event'||p.topic==='escalation'){if(p.state)setState(p.state,p.reason);if(p.event_id)eventId=p.event_id;addEvent(p)}
   else if(p.topic==='ack'){setState(p.state||'IDLE','acknowledged');addEvent(p)}
   else if(p.topic==='heartbeat'){lastHb=Date.now()}
@@ -83,8 +103,7 @@ function connect(){const es=new EventSource('/events');es.onmessage=e=>{try{hand
 connect();
 setInterval(()=>{const el=$('hb');if(lastHb===null)return;const age=Math.round((Date.now()-lastHb)/1000);
   el.textContent='last heartbeat '+age+' s ago';el.classList.toggle('stale',age>30)},1000);
-$('ack').onclick=async()=>{const user=$('user').value.trim()||'nurse';
-  await fetch('/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user,event_id:eventId})})};
+$('ack').onclick=async()=>{const user=$('user').value.trim()||'nurse';await post('/ack',{user,event_id:eventId})};
 </script></body></html>
 """
 
@@ -98,6 +117,7 @@ class WebClient(Notifier):
         self.port = port
         self.bed = bed
         self._ack_callbacks: list[AckCallback] = [on_ack] if on_ack else []
+        self._select_callbacks: list[AckCallback] = []
         self._history: deque[dict[str, Any]] = deque(maxlen=history)
         self._subscribers: set[queue.Queue[dict[str, Any] | None]] = set()
         self._lock = threading.Lock()
@@ -131,7 +151,7 @@ class WebClient(Notifier):
                     self.send_error(404)
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path != "/ack":
+                if self.path not in ("/ack", "/select"):
                     self.send_error(404)
                     return
                 length = int(self.headers.get("Content-Length") or 0)
@@ -140,14 +160,19 @@ class WebClient(Notifier):
                     data = json.loads(raw or b"{}")
                     if not isinstance(data, dict):
                         raise ValueError("body must be a JSON object")
+                    if self.path == "/select":
+                        reply = client._parse_select(data)
                 except Exception as exc:  # noqa: BLE001
                     self.send_error(400, str(exc))
                     return
-                ack = {"user": str(data.get("user") or "nurse"), "t": time.time()}
-                if data.get("event_id"):
-                    ack["event_id"] = data["event_id"]
-                client._dispatch_ack(ack)
-                body = json.dumps(ack).encode()
+                if self.path == "/ack":
+                    reply = {"user": str(data.get("user") or "nurse"), "t": time.time()}
+                    if data.get("event_id"):
+                        reply["event_id"] = data["event_id"]
+                    client._dispatch(client._ack_callbacks, reply, "ack")
+                else:
+                    client._dispatch(client._select_callbacks, reply, "select")
+                body = json.dumps(reply).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -189,12 +214,25 @@ class WebClient(Notifier):
     def on_ack(self, callback: AckCallback) -> None:
         self._ack_callbacks.append(callback)
 
-    def _dispatch_ack(self, ack: dict[str, Any]) -> None:
-        for cb in list(self._ack_callbacks):
+    def on_select(self, callback: AckCallback) -> None:
+        """Patient selection from the page: ``{"n": k}`` (k = 0 clears the lock) or ``{"survey": bool}``."""
+        self._select_callbacks.append(callback)
+
+    @staticmethod
+    def _parse_select(data: dict[str, Any]) -> dict[str, Any]:
+        if "survey" in data:
+            return {"survey": bool(data["survey"]), "t": time.time()}
+        n = data.get("n")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0 or n > 99:
+            raise ValueError("n must be an integer 0..99 (0 = auto), or pass survey: true/false")
+        return {"n": n, "t": time.time()}
+
+    def _dispatch(self, callbacks: list[AckCallback], payload: dict[str, Any], label: str) -> None:
+        for cb in list(callbacks):
             try:
-                cb(ack)
+                cb(payload)
             except Exception as exc:  # noqa: BLE001
-                self.errors.append(f"ack callback: {type(exc).__name__}: {exc}")
+                self.errors.append(f"{label} callback: {type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------------ SSE
 

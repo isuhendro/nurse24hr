@@ -34,6 +34,20 @@ fi
 
 uv sync --quiet
 
+# Stop any monitor still running from an earlier launch so the camera and the
+# web port are free. Matches the uv wrapper and the venv entry point, but never
+# this script, the replay/session tools, or an unrelated process.
+old_pids=$(pgrep -f -- '(uv run nurse24hr( |$)|\.venv/bin/nurse24hr( |$))' | grep -vx "$$" || true)
+if [ -n "$old_pids" ]; then
+    echo "stopping old monitor (pid $(echo $old_pids | tr '\n' ' '))..."
+    kill $old_pids 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f -- '(uv run nurse24hr( |$)|\.venv/bin/nurse24hr( |$))' >/dev/null || break
+        sleep 0.5
+    done
+    pkill -9 -f -- '(uv run nurse24hr( |$)|\.venv/bin/nurse24hr( |$))' 2>/dev/null || true
+fi
+
 # Default: webcam with the nurse page. Any explicit flags replace the defaults.
 if [ $# -eq 0 ]; then
     set -- --source webcam --web

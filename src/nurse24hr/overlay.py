@@ -28,6 +28,8 @@ class HudInfo:
     dropped: int
     roi: tuple[int, int, int, int] | None
     paused: bool = False
+    selection: str | None = None
+    """Who the patient is, from the perceiver (``selection_label``)."""
 
 
 def _fmt(v: float | None, spec: str = ".2f") -> str:
@@ -55,6 +57,8 @@ def draw_hud(img: np.ndarray, info: HudInfo, f: Features | None, m: EventMachine
         f"src {info.source}  {info.fps:4.1f} fps  age {info.frame_age_s * 1000:4.0f} ms  dropped {info.dropped}",
         f"perception: {info.perceiver}",
     ]
+    if info.selection:
+        lines.append(info.selection)
     if f is not None:
         lines += [
             f"d {_fmt(f.d)}  d_tape {_fmt(f.d_tape)}  conf {f.conf:.2f}  persons {f.n_persons}",
@@ -69,4 +73,4 @@ def draw_hud(img: np.ndarray, info: HudInfo, f: Features | None, m: EventMachine
         cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         y += 20
 
-    cv2.putText(img, "q quit  a ack  space pause", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(img, "q quit  a ack  space pause  s survey faces  double-click/1-9 select patient  0 auto", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)

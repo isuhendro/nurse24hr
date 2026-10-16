@@ -82,7 +82,47 @@ uv run nurse24hr --source data/sessions/s01/video.mp4 --log out/s01.parquet
 uv run nurse24hr --source session.mp4 --headless --fast --no-record
 ```
 
-Keys in the window: `q` quit, `a` acknowledge a latched ALARM or FAULT, space pause.
+Keys in the window: `q` quit, `a` acknowledge a latched ALARM or FAULT, space pause,
+`s` survey (scan the whole bed and number every face), `1`-`9` or a mouse
+double-click select that person as the patient, `0` back to automatic. The same letters and
+digits work typed in the terminal, and the nurse page has one button per head.
+
+### Choosing the patient when several people are in view
+
+Every head the models see is numbered left to right on the overlay. Besides
+the per-frame models, which only look at a zoom crop around the current head,
+a background scan of the whole bed runs once a second (`survey_every_s`), in
+overlapping tiles (`survey_tile_px`, because the face detector shrinks its
+input to 128 px and loses any face under about 150 px on a full 1280 px frame),
+and also tries the frame turned on its side (`survey_rotations`), so a second
+person further from the camera, or a patient lying sideways, still gets a
+number (marked "lying" when found that way). Until you choose, the monitor follows whichever face it
+acquired first and re-acquires freely after a loss, which is how a visitor
+leaning in once got tracked as the patient. Click the patient (or press their number) to **lock** on them: from
+then on only a head within `perception.lock_radius` face widths of where they
+were last seen counts as the patient, every other face is treated as someone
+else, and the lock never expires or jumps on its own. Once the patient has been
+lost for a couple of seconds, a head within `relock_radius` face widths that
+lies the same way and has the same size is accepted again, which covers a
+nudged camera; an upright, larger visitor leaning in is not. If the patient
+moves further than that while unseen, the monitor reports "patient not
+visible", goes to FAULT after `t_fault` seconds, and waits for you to select
+again or press `0`.
+
+Hands the hand model reports near the tube are cross-checked against the
+body model: a hand counts only if the body model also placed a hand there in
+the last `perception.hand_corroborate_s` seconds, and hands shorter than
+`hand_min_len` face widths are dropped. Both rules come from live false WARNs
+where the hand model drew whole phantom hands on a cheek or a taped tube.
+Dropped hands show as a red cross in the window with the reason.
+
+The selection is saved to `perception.patient_file` (default
+`state/patient.json`) and restored at the next start, so the monitor keeps
+watching the same patient across restarts without anyone touching it. To
+change patients, double-click the other person or press their number; to go back to
+automatic, press `0`. Both overwrite the saved file. Delete the file (or set
+`patient_file: null`) to start fresh. Selection by mouse needs a double-click
+on purpose: a single click only brings the window to the front.
 With no perception (`--perceiver none`) the system raises FAULT after five
 seconds: no confident view of the patient, fail loud by design.
 

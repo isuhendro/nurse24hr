@@ -21,6 +21,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
@@ -81,11 +82,22 @@ def build_perceiver(pcfg: dict[str, Any], backend: str | None = None, roi=None) 
         pose_every_n=int(pcfg.get("pose_every_n", 1)),
         pose_detection_confidence=float(pcfg.get("pose_detection_confidence", 0.25)),
         pose_hand_min_vis=float(pcfg.get("pose_hand_min_vis", 0.5)),
+        hand_min_len=float(pcfg.get("hand_min_len", 0.45)),
+        hand_corroborate_s=float(pcfg.get("hand_corroborate_s", 1.5)),
         face_scale_max=float(pcfg.get("face_scale_max", 1.6)),
         face_relearn_s=float(pcfg.get("face_relearn_s", 30.0)),
+        lock_radius=float(pcfg.get("lock_radius", 2.0)),
+        relock_radius=float(pcfg.get("relock_radius", 4.0)),
+        survey_every_s=float(pcfg.get("survey_every_s", 1.0)),
+        survey_rotations=tuple(int(r) for r in pcfg.get("survey_rotations", (0, 90, 270))),
+        survey_pose=bool(pcfg.get("survey_pose", True)),
+        survey_tile_px=int(pcfg.get("survey_tile_px", 640)),
+        survey_cycle=bool(pcfg.get("survey_cycle", True)),
         min_detection_confidence=float(pcfg.get("min_detection_confidence", 0.4)),
+        hand_detection_confidence=float(pcfg.get("hand_detection_confidence", 0.6)),
+        hand_tracking_confidence=float(pcfg.get("hand_tracking_confidence", 0.8)),
         num_hands=int(pcfg.get("num_hands", 4)),
-        num_faces=int(pcfg.get("num_faces", 2)),
+        num_faces=int(pcfg.get("num_faces", 3)),
     ))
     weights = pcfg.get("tube_weights")
     if weights:
@@ -111,6 +123,8 @@ class Pipeline:
     bed: str = "bed-01"
     roi: tuple[int, int, int, int] | None = None
     fps: float = 15.0
+    patient_file: Path | None = None
+    """Where the patient lock is saved so it survives a restart (``perception.patient_file``)."""
 
     def close(self) -> None:
         for part in (self.recorder, self.logger, self.alarm, self.web, self.mqtt):
@@ -164,13 +178,38 @@ def build_pipeline(cfg: dict[str, Any], *, headless: bool, perceiver: Perceiver 
     if logger is not None:
         print(f"features log: {log_path}", flush=True)
 
+    pf = cfg.get("perception", {}).get("patient_file", "state/patient.json")
     return Pipeline(
         thresholds=th,
         perceiver=perceiver or build_perceiver(cfg.get("perception", {})),
         notifier=notifier, alarm=alarm, recorder=recorder, logger=logger,
         watchdog_cfg=WatchdogConfig.from_dict(cfg.get("watchdog")),
         web=web_client, mqtt=mqtt_client, bed=bed, roi=roi, fps=cap_fps,
+        patient_file=Path(pf) if pf else None,
     )
+
+
+def save_patient(selector: Any, path: Path | None) -> None:
+    """Write the perceiver's lock to ``path`` (or record that there is none)."""
+    if path is None or selector is None:
+        return
+    state = {**selector.lock_state, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=1))
+
+
+def load_patient(selector: Any, path: Path | None) -> dict | None:
+    """Restore a saved lock into the perceiver. Returns the saved state when a lock was restored."""
+    if path is None or selector is None or not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"patient file {path}: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(state, dict) or not state.get("locked"):
+        return None
+    return state if selector.restore_lock(state) else None
 
 
 def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = False, loop: bool = False,
@@ -184,7 +223,13 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
     cap = CaptureThread(source, slot, fps=p.fps, realtime=realtime, loop=loop)
     recent: deque[float] = deque(maxlen=30)
     state_holder = {"last_features_wall": None, "sig": None, "fps": 0.0, "frame_t": 0.0}
-    ack_requests: deque[dict[str, Any]] = deque()
+    commands: deque[dict[str, Any]] = deque()
+    """Acks and patient selections from the window, the terminal and the network, applied on the loop thread."""
+    selector = _selectable(p.perceiver)
+    restored = load_patient(selector, p.patient_file)
+    if restored:
+        print(f"patient: lock restored from {p.patient_file} (saved {restored.get('saved_at', '?')}): "
+              f"head at ({restored['cx']:.0f}, {restored['cy']:.0f}). Click another person or press 0 to change.", flush=True)
 
     def emit(ev: Event) -> None:
         if on_event:
@@ -198,12 +243,17 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
     quit_flag = threading.Event()
 
     def request_ack(payload: dict[str, Any]) -> None:
-        ack_requests.append(payload)  # applied on the loop thread, never from a network thread
+        commands.append({"cmd": "ack", **payload})  # applied on the loop thread, never from a network thread
+
+    def request_select(payload: dict[str, Any]) -> None:
+        commands.append({"cmd": "select", **payload})
 
     for client in (p.web, p.mqtt):
         if client is not None:
             client.on_ack(request_ack)
-    _start_stdin_reader(request_ack, quit_flag)
+            if hasattr(client, "on_select"):
+                client.on_select(request_select)
+    _start_stdin_reader(commands, quit_flag)
 
     def do_ack(user: str) -> None:
         t = state_holder["frame_t"]
@@ -217,6 +267,43 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
         if hasattr(p.perceiver, "reset_baseline"):
             p.perceiver.reset_baseline()
 
+    def do_select(c: dict[str, Any]) -> None:
+        """Lock the perceiver onto one head, clear the lock, or toggle survey mode."""
+        if selector is None:
+            print("patient selection needs the MediaPipe perceiver", flush=True)
+            return
+        if c.get("survey") is not None:
+            v = c["survey"]
+            selector.survey = (not selector.survey) if v == "toggle" else bool(v)
+            print("survey mode " + ("on: whole bed scanned, every face numbered" if selector.survey else "off"), flush=True)
+            return
+        if "x" in c and "y" in c:
+            chosen = selector.select_at(float(c["x"]), float(c["y"]))
+            n = None if chosen is None else selector.candidates.index(chosen) + 1
+        else:
+            n = int(c.get("n", 0))
+            chosen = selector.select(n)
+        if n is not None and n <= 0:
+            print("patient: auto (lock cleared)", flush=True)
+        elif chosen is None:
+            print(f"patient: no head there ({len(selector.candidates)} in view)", flush=True)
+            return
+        else:
+            print(f"patient: locked on #{n} at ({chosen.center[0]:.0f}, {chosen.center[1]:.0f})", flush=True)
+        save_patient(selector, p.patient_file)  # survives a restart
+
+    def do_command(c: dict[str, Any]) -> None:
+        if c.get("cmd") == "select":
+            do_select(c)
+        else:
+            do_ack(str(c.get("user", "remote")))
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
+        # Double-click, not click: a click to bring the window to the front landed on a face and
+        # silently re-locked the patient onto the visitor (2026-10-16).
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            commands.append({"cmd": "select", "x": x, "y": y})
+
     def probe() -> ProbeSample:
         return ProbeSample(cap.last_read_t, cap.error, cap.ended.is_set(), state_holder["last_features_wall"],
                            state_holder["sig"], fps=state_holder["fps"], frames_read=cap.frames_read)
@@ -227,14 +314,17 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
     watchdog = WatchdogThread(Watchdog(p.watchdog_cfg, p.notifier), probe, on_fault=on_fault)
     cap.start()
     watchdog.start()
+    if not headless:
+        cv2.namedWindow(WINDOW)
+        cv2.setMouseCallback(WINDOW, on_mouse)
     paused = False
     processed = 0
     last_state_pub = -1.0
     f = None
     try:
         while True:
-            while ack_requests:
-                do_ack(str(ack_requests.popleft().get("user", "remote")))
+            while commands:
+                do_command(commands.popleft())
             if quit_flag.is_set():
                 break
             if cap.error:
@@ -247,7 +337,7 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
                         print(f"capture error: {cap.error}", file=sys.stderr)
                     break
                 p.alarm.tick(state_holder["frame_t"])
-                if not headless and _handle_keys(do_ack) == "quit":
+                if not headless and _handle_keys(commands) == "quit":
                     break
                 continue
 
@@ -269,7 +359,8 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
             if frame.t - last_state_pub >= 1.0:
                 last_state_pub = frame.t
                 p.notifier.notify("state", {"bed": p.bed, "state": machine.state.value, "t": frame.t,
-                                            "d": None if f is None else f.d, "conf": None if f is None else f.conf})
+                                            "d": None if f is None else f.d, "conf": None if f is None else f.conf,
+                                            **(selector.selection if selector is not None else {})})
 
             now = time.monotonic()
             recent.append(now)
@@ -280,9 +371,10 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
                 img = frame.image.copy()
                 if f is not None:
                     p.perceiver.draw(img, f)
-                draw_hud(img, HudInfo(str(source), p.perceiver.name, state_holder["fps"], age, slot.dropped, p.roi, paused), f, machine)
+                draw_hud(img, HudInfo(str(source), p.perceiver.name, state_holder["fps"], age, slot.dropped, p.roi, paused,
+                                      selection=None if selector is None else selector.selection_label), f, machine)
                 cv2.imshow(WINDOW, img)
-                action = _handle_keys(do_ack)
+                action = _handle_keys(commands)
                 if action == "quit":
                     break
                 if action == "pause":
@@ -299,9 +391,18 @@ def run(source: str, p: Pipeline, *, realtime: bool = True, headless: bool = Fal
     return machine
 
 
-def _start_stdin_reader(request_ack, quit_flag: threading.Event) -> None:
-    """Accept ``a`` (ack) and ``q`` (quit) typed in the terminal, so acknowledging
-    does not depend on the video window having keyboard focus."""
+def _selectable(perceiver: Any) -> Any:
+    """The object that implements patient selection: the MediaPipe perceiver itself or the one a
+    tube-detector wrapper sits on. None when the backend cannot select (``none``)."""
+    for obj in (perceiver, getattr(perceiver, "base", None)):
+        if obj is not None and hasattr(obj, "select") and hasattr(obj, "candidates"):
+            return obj
+    return None
+
+
+def _start_stdin_reader(commands: deque, quit_flag: threading.Event) -> None:
+    """Accept ``a`` (ack), ``q`` (quit), ``s`` (survey), ``1``-``9`` (select that head) and ``0`` (auto)
+    typed in the terminal, so controlling the monitor does not depend on the video window having focus."""
     try:
         if not sys.stdin or not sys.stdin.isatty():
             return
@@ -312,24 +413,36 @@ def _start_stdin_reader(request_ack, quit_flag: threading.Event) -> None:
         for line in sys.stdin:
             cmd = line.strip().lower()
             if cmd in ("a", "ack"):
-                request_ack({"user": "terminal"})
+                commands.append({"cmd": "ack", "user": "terminal"})
             elif cmd in ("q", "quit"):
                 quit_flag.set()
                 return
+            elif cmd in ("s", "survey"):
+                commands.append({"cmd": "select", "survey": "toggle"})
+            elif cmd in ("0", "auto"):
+                commands.append({"cmd": "select", "n": 0})
+            elif cmd.isdigit():
+                commands.append({"cmd": "select", "n": int(cmd)})
 
     threading.Thread(target=reader, name="stdin-ack", daemon=True).start()
-    print("terminal: type a + Enter to acknowledge, q + Enter to quit", flush=True)
+    print("terminal: a + Enter acknowledge, q quit, s survey all faces, 1-9 select that person, 0 auto", flush=True)
 
 
-def _handle_keys(do_ack) -> str | None:
+def _handle_keys(commands: deque) -> str | None:
     key = cv2.waitKey(1) & 0xFF
     if key in (ord("q"), 27):
         return "quit"
     if key == ord("a"):
-        do_ack("local")
+        commands.append({"cmd": "ack", "user": "local"})
         return "ack"
     if key == ord(" "):
         return "pause"
+    if key == ord("s"):
+        commands.append({"cmd": "select", "survey": "toggle"})
+        return "survey"
+    if ord("0") <= key <= ord("9"):
+        commands.append({"cmd": "select", "n": key - ord("0")})
+        return "select"
     return None
 
 
